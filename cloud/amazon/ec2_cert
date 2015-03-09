@@ -1,0 +1,219 @@
+#!/usr/bin/python
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: ec2_cert
+short_description: Administrate IAM server certificates
+description:
+    - List, upload and delete IAM server certificates for use with ELB.
+version_added: "1.9"
+options:
+  aws_secret_key:
+    description:
+      - AWS secret key. If not set then the value of the AWS_SECRET_KEY environment variable is used.
+    required: false
+    default: None
+    aliases: ['ec2_secret_key', 'secret_key' ]
+  aws_access_key:
+    description:
+      - AWS access key. If not set then the value of the AWS_ACCESS_KEY environment variable is used.
+    required: false
+    default: None
+    aliases: ['ec2_access_key', 'access_key' ]
+  cert_chain:
+    description:
+      - The contents of the certificate chain. This is typically a concatenation of the PEM-encoded public key certificates of the chain.  Required if state='present'.
+    required: false
+  cert_name:
+    description:
+      - The name for the server certificate. Do not include the path in this value. Required if state='present' or state='absent'
+    required: false
+  cert_path:
+    description:
+      - The path for the server certificate.
+    required: false
+    default: "/"
+  cert_public_key:
+    description:
+      - The contents of the public key certificate in PEM-encoded format. Required if state='present'.
+    required: false
+  cert_private_key:
+    description:
+      - The contents of the private key in PEM-encoded format. Required if state='present'.
+    required: false
+  region:
+    description:
+      - The AWS region to use. If not specified then the value of the EC2_REGION environment variable, if any, is used.
+    required: true
+    aliases: ['aws_region', 'ec2_region']
+  state:
+    description:
+      - If 'list', returns a list of all server certificates, if 'present' idempotently uploads the given certificate, and if 'absent' removes it.
+    required: false
+    default: 'present'
+'''
+
+EXAMPLES = '''
+- local_action:
+    module: ec2_cert
+    cert_name: my-cert
+    cert_path: "/my-folder/"
+    cert_public_key: "XXXX"
+    cert_private_key: "XXXX"
+    state: present
+  register: cert
+
+- debug:
+    msg: "{{ cert }}"
+'''
+
+import sys
+import time
+
+try:
+    import boto.iam
+except ImportError:
+    print "failed=True msg='boto required for this module'"
+    sys.exit(1)
+
+AWS_REGIONS = list(map(lambda r: r.name,
+                       boto.iam.regions()))
+
+def list_certs (iam):
+    data = iam.list_server_certs()
+    response = data.list_server_certificates_response
+    result = response.list_server_certificates_result
+    return result.server_certificate_metadata_list
+
+def get_server_cert(iam, cert_name):
+    certs = list_certs(iam)
+    matching_certs = (c for c in certs if c.server_certificate_name == cert_name)
+    return next(matching_certs, None)
+
+def upload_cert (iam,
+                 cert_name,
+                 cert_public_key,
+                 cert_private_key,
+                 cert_chain,
+                 cert_path):
+
+    cert = get_server_cert(iam, cert_name)
+
+    if cert:
+        changed = False
+    else:
+        changed = True
+        data = iam.upload_server_cert(cert_name,
+                                      cert_public_key,
+                                      cert_private_key,
+                                      cert_chain,
+                                      cert_path)
+        response = data.upload_server_certificate_response
+        result = response.upload_server_certificate_result
+        cert = result.server_certificate_metadata
+
+    return {'changed': changed, 'cert': cert}
+
+def delete_cert (iam, cert_name):
+    if get_server_cert(iam, cert_name):
+        changed = True
+        iam.delete_server_cert(cert_name)
+    else:
+        changed = False
+
+    return {'changed': changed, 'cert': None}
+
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            region = dict(aliases=['aws_region', 'ec2_region'], choices=AWS_REGIONS, required=True),
+            aws_secret_key = dict(aliases=['ec2_secret_key', 'secret_key'], no_log=True),
+            aws_access_key = dict(aliases=['ec2_access_key', 'access_key']),
+            cert_name = dict(),
+            cert_public_key = dict(),
+            cert_private_key = dict(no_log=True),
+            cert_chain = dict(),
+            cert_path = dict(default="/"),
+            state = dict(default="present", choices=['present', 'absent', 'list'])
+        )
+    )
+
+    region = module.params.get('region')
+    aws_secret_key = module.params.get('aws_secret_key')
+    aws_access_key = module.params.get('aws_access_key')
+
+    if not aws_secret_key:
+        if  'AWS_SECRET_KEY' in os.environ:
+            aws_secret_key = os.environ['AWS_SECRET_KEY']
+        elif 'EC2_SECRET_KEY' in os.environ:
+            aws_secret_key = os.environ['EC2_SECRET_KEY']
+
+    if not aws_access_key:
+        if 'AWS_ACCESS_KEY' in os.environ:
+            aws_access_key = os.environ['AWS_ACCESS_KEY']
+        elif 'EC2_ACCESS_KEY' in os.environ:
+            aws_access_key = os.environ['EC2_ACCESS_KEY']
+
+    try:
+        iam = boto.iam.connect_to_region(region,
+                                         aws_access_key_id=aws_access_key,
+                                         aws_secret_access_key=aws_secret_key)
+    except boto.exception.NoAuthHandlerFound, e:
+        module.fail_json(msg = str(e))
+
+
+    state = module.params.get('state')
+    if state == 'list':
+        module.exit_json(changed=False, certs=list_certs(iam))
+
+    cert_name = module.params.get('cert_name')
+    if not cert_name:
+        module.fail_json(msg="cert_name is required when state is '%s'" % state)
+
+    if state == 'absent':
+        result = delete_cert(iam, cert_name)
+
+    elif state == 'present':
+        cert_public_key = module.params.get('cert_public_key')
+        if not cert_public_key:
+            module.fail_json(msg="cert_public_key is required when state='present'")
+
+        cert_private_key = module.params.get('cert_private_key')
+        if not cert_private_key:
+            module.fail_json(msg="cert_private_key is required when state='present'")
+
+        cert_chain = module.params.get('cert_chain')
+        if not cert_chain:
+            module.fail_json(msg="cert_chain is required when state='present'")
+
+        cert_path = module.params.get('cert_path')
+
+        result = upload_cert(iam,
+                             cert_name,
+                             cert_public_key,
+                             cert_private_key,
+                             cert_chain,
+                             cert_path)
+
+
+    module.exit_json(changed=result['changed'],
+                     cert=result['cert'])
+
+# this is magic, see lib/ansible/module_common.py
+#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+
+main()
